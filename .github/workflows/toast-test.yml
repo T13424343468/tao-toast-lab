@@ -1,0 +1,96 @@
+name: toast-test
+on:
+  workflow_dispatch: {}
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Toast launch-path test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $dir = "$env:USERPROFILE\toasttest"
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+          Set-Location $dir
+
+          New-Item -Path 'HKCU:\Software\Classes\AppUserModelId\Win11ToastTest' -Force | Out-Null
+          New-ItemProperty -Path 'HKCU:\Software\Classes\AppUserModelId\Win11ToastTest' -Name DisplayName -Value 'Win11ToastTest' -Force | Out-Null
+          New-ItemProperty -Path 'HKCU:\Software\Classes\AppUserModelId\Win11ToastTest' -Name ShowInSettings -Value 1 -PropertyType DWord -Force | Out-Null
+
+          $bat = @'
+          @echo off
+          reg add "HKCU\Software\Classes\AppUserModelId\Win11ToastTest" /v DisplayName /t REG_SZ /d "Win11ToastTest" /f >nul 2>&1
+          reg add "HKCU\Software\Classes\AppUserModelId\Win11ToastTest" /v ShowInSettings /t REG_DWORD /d 1 /f >nul 2>&1
+          if /i "%~1"=="/hidden" (
+              powershell -NoProfile -ExecutionPolicy Bypass -Command "try{[void][Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime];$t=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);$x=$t.GetElementsByTagName('text');[void]$x.Item(0).AppendChild($t.CreateTextNode('Win11ToastTest'));[void]$x.Item(1).AppendChild($t.CreateTextNode('%~2'));[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Win11ToastTest').Show([Windows.UI.Notifications.ToastNotification]::new($t));Start-Sleep -Seconds %~3}catch{$_ | Out-File -FilePath '%~dp0err_%~2.txt';Start-Sleep -Seconds 1}"
+              exit /b
+          )
+          echo not-hidden-call >> "%~dp0out_%~2.txt"
+          '@
+          Set-Content -Path "$dir\test_hidden.bat" -Value $bat -Encoding ASCII
+
+          Set-Content -Path "$dir\run_A.vbs" -Value ('CreateObject("WScript.Shell").Run "cmd /c ""' + "$dir" + '\test_hidden.bat"" /hidden CloudTestA 0", 0, False') -Encoding ASCII
+          Set-Content -Path "$dir\run_B.vbs" -Value ('CreateObject("WScript.Shell").Run "cmd /c ""' + "$dir" + '\test_hidden.bat"" /hidden CloudTestB 3", 0, False') -Encoding ASCII
+          Set-Content -Path "$dir\run_D.vbs" -Value ('CreateObject("WScript.Shell").Run "cmd /c ""' + "$dir" + '\test_hidden.bat"" /hidden CloudTestD 3", 0, False') -Encoding ASCII
+
+          $shot = @'
+          param([string]$Name)
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type -AssemblyName System.Drawing
+          $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+          $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.CopyFromScreen($b.X, $b.Y, 0, 0, $bmp.Size)
+          $bmp.Save("$env:USERPROFILE\toasttest\$Name")
+          Write-Output "saved $Name"
+          '@
+          Set-Content -Path "$dir\shot.ps1" -Value $shot -Encoding UTF8
+
+          Write-Output "=== C: direct console (same as the config bat) ==="
+          powershell -NoProfile -ExecutionPolicy Bypass -Command "try{[void][Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime];`$t=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);`$x=`$t.GetElementsByTagName('text');[void]`$x.Item(0).AppendChild(`$t.CreateTextNode('Win11ToastTest'));[void]`$x.Item(1).AppendChild(`$t.CreateTextNode('CloudTestC-direct'));[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Win11ToastTest').Show([Windows.UI.Notifications.ToastNotification]::new(`$t));Start-Sleep -Seconds 3}catch{`$_ | Out-File err_C.txt;Start-Sleep -Seconds 1}"
+          Start-Sleep -Seconds 3
+          pwsh -File shot.ps1 -Name shot_C.png
+          Start-Sleep -Seconds 6
+
+          Write-Output "=== A: vbs hidden path, toast then exit at once ==="
+          wscript.exe "$dir\run_A.vbs"
+          Start-Sleep -Seconds 4
+          pwsh -File shot.ps1 -Name shot_A.png
+          Start-Sleep -Seconds 6
+
+          Write-Output "=== B: vbs hidden path, toast with 3s commit sleep ==="
+          wscript.exe "$dir\run_B.vbs"
+          Start-Sleep -Seconds 4
+          pwsh -File shot.ps1 -Name shot_B.png
+          Start-Sleep -Seconds 6
+
+          Write-Output "=== D: scheduled task with RunLevel Highest ==="
+          $tr = "wscript.exe $dir\run_D.vbs"
+          schtasks /create /tn ToastTestJob /tr "$tr" /sc once /st 23:59 /rl HIGHEST /f
+          schtasks /run /tn ToastTestJob
+          Start-Sleep -Seconds 6
+          pwsh -File shot.ps1 -Name shot_D.png
+          Start-Sleep -Seconds 2
+
+          $db = "$env:LOCALAPPDATA\Microsoft\Windows\Notifications\wpndatabase.db"
+          if (Test-Path $db) {
+            $raw = [IO.File]::ReadAllBytes($db)
+            $uni = [Text.Encoding]::Unicode.GetString($raw)
+            $u8 = [Text.Encoding]::UTF8.GetString($raw)
+            foreach ($m in 'CloudTestA','CloudTestB','CloudTestC','CloudTestD') {
+              Write-Output ("DB " + $m + " unicode=" + $uni.Contains($m) + " utf8=" + $u8.Contains($m))
+            }
+          } else { Write-Output "no wpndatabase found" }
+
+          Get-ChildItem $dir -Filter *.txt | ForEach-Object { Write-Output "=== $($_.Name)"; Get-Content $_.FullName }
+          schtasks /query /tn ToastTestJob /v /fo list 2>$null | Select-Object -First 5
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: toast-evidence
+          path: |
+            **/toasttest/*.png
+            **/toasttest/*.txt
